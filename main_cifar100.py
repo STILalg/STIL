@@ -247,15 +247,6 @@ def contrast_cls(every_task_base, sim_tasks, sim_scores, model, task_id, device,
                 sim.append(proj_weight.data)
                 dis = list(set(range(task_id)) - set(sim_tasks[cnt]))
                 tt = random.sample(dis, 1)[0]
-
-                if task_id == 3:
-                    tt = 1
-                elif task_id == 7:
-                    tt = 3
-                elif task_id == 8:
-                    tt = 7
-                elif task_id == 9:
-                    tt = 4
                 tmp = torch.FloatTensor(every_task_base[tt][cnt]).to(device)
                 norm_project = torch.mm(tmp, tmp.transpose(1, 0))
                 proj_weight = torch.mm(params.view(sz, -1),
