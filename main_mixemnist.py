@@ -654,7 +654,7 @@ if __name__ == "__main__":
     parser.add_argument('--dis_ntasks',default=10,choices=[10,20, 35],type=int,required=False,help='(default=%(default)d)')
     parser.add_argument('--sim_ntasks',default=10,choices=[10,20, 35],type=int,required=False,help='(default=%(default)d)')
     parser.add_argument('--classptask',default=5,type=int,required=False,help='(default=%(default)d)')
-    parser.add_argument('--idrandom',default=2,type=int,required=False,help='(default=%(default)d)')
+    parser.add_argument('--idrandom',default=3,type=int,required=False,help='(default=%(default)d)')
     parser.add_argument('--data_size',default='small',type=str,required=False,help='(default=%(default)s)')
     parser.add_argument("--num_class_femnist",default=62,type=int,required=False,help='(default=%(default)d)')
 
