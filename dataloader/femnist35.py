@@ -20,7 +20,7 @@ def get(seed=0, pc_valid=0,idrandom=3):
     data_femnist, taskcla_femnist, size_femnist = read_femnist(seed=seed,args=0)
 
     #all_emnist = [data_emnist[x]['name'] for x in range(dis_ntasks)]
-    all_femnist = [data_femnist[x]['name'] for x in range(35)]
+    all_femnist = [data_femnist[x]['name'] for x in range(36)]
     print("all femnist:", all_femnist)
 
     f_name = 'mixemnist_random_'+str(70)
