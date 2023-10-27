@@ -56,16 +56,16 @@ def read_cifar100(seed=0,pc_valid=0.10,args=0):
     n_class = 100
 
 
-    if not os.path.isdir('./dat/binary_cifar100/'+str(n_tasks)+'/'):
-        os.makedirs('./dat/binary_cifar100/'+str(n_tasks))
+    if not os.path.isdir('./data/binary_cifar100/'+str(n_tasks)+'/'):
+        os.makedirs('./data/binary_cifar100/'+str(n_tasks))
 
         mean=[x/255 for x in [125.3,123.0,113.9]]
         std=[x/255 for x in [63.0,62.1,66.7]]
 
         # CIFAR100
         dat={}
-        dat['train']=datasets.CIFAR100('./dat/',train=True,download=True,transform=transforms.Compose([transforms.ToTensor(),transforms.Normalize(mean,std)]))
-        dat['test']=datasets.CIFAR100('./dat/',train=False,download=True,transform=transforms.Compose([transforms.ToTensor(),transforms.Normalize(mean,std)]))
+        dat['train']=datasets.CIFAR100('./data/',train=True,download=True,transform=transforms.Compose([transforms.ToTensor(),transforms.Normalize(mean,std)]))
+        dat['test']=datasets.CIFAR100('./data/',train=False,download=True,transform=transforms.Compose([transforms.ToTensor(),transforms.Normalize(mean,std)]))
 
         n_per_task = len([1 for image,target in torch.utils.data.DataLoader(dat['train'],batch_size=1,shuffle=True) if target.numpy()[0] == 1])
         print('n_per_task: ',n_per_task)
@@ -96,8 +96,8 @@ def read_cifar100(seed=0,pc_valid=0.10,args=0):
             for s in ['train','test']:
                 data[t][s]['x']=torch.stack(data[t][s]['x']).view(-1,size[0],size[1],size[2])
                 data[t][s]['y']=torch.LongTensor(np.array(data[t][s]['y'],dtype=int)).view(-1)
-                torch.save(data[t][s]['x'], os.path.join(os.path.expanduser('./dat/binary_cifar100/'+str(n_tasks)),'data'+str(t)+s+'x.bin'))
-                torch.save(data[t][s]['y'], os.path.join(os.path.expanduser('./dat/binary_cifar100/'+str(n_tasks)),'data'+str(t)+s+'y.bin'))
+                torch.save(data[t][s]['x'], os.path.join(os.path.expanduser('./data/binary_cifar100/'+str(n_tasks)),'data'+str(t)+s+'x.bin'))
+                torch.save(data[t][s]['y'], os.path.join(os.path.expanduser('./data/binary_cifar100/'+str(n_tasks)),'data'+str(t)+s+'y.bin'))
 
     # Load binary files
     data={}
@@ -107,8 +107,8 @@ def read_cifar100(seed=0,pc_valid=0.10,args=0):
         data[i] = dict.fromkeys(['name','ncla','train','test'])
         for s in ['train','test']:
             data[i][s]={'x':[],'y':[]}
-            data[i][s]['x']=torch.load(os.path.join(os.path.expanduser('./dat/binary_cifar100/'+str(n_tasks)),'data'+str(ids[i])+s+'x.bin'))
-            data[i][s]['y']=torch.load(os.path.join(os.path.expanduser('./dat/binary_cifar100/'+str(n_tasks)),'data'+str(ids[i])+s+'y.bin'))
+            data[i][s]['x']=torch.load(os.path.join(os.path.expanduser('./data/binary_cifar100/'+str(n_tasks)),'data'+str(ids[i])+s+'x.bin'))
+            data[i][s]['y']=torch.load(os.path.join(os.path.expanduser('./data/binary_cifar100/'+str(n_tasks)),'data'+str(ids[i])+s+'y.bin'))
         data[i]['ncla']=len(np.unique(data[i]['train']['y'].numpy()))
         data[i]['name']='cifar100-'+str(ids[i])
 
@@ -149,18 +149,18 @@ def read_celeba(seed=0,pc_valid=0.10,args=0):
     elif 'full' in args.data_size:
         data_type = 'full'
 
-    if not os.path.isdir('./dat/'+data_type+'_binary_celeba/'+str(n_tasks)+'/'):
-        os.makedirs('./dat/'+data_type+'_binary_celeba/'+str(n_tasks))
+    if not os.path.isdir('./data/'+data_type+'_binary_celeba/'+str(n_tasks)+'/'):
+        os.makedirs('./data/'+data_type+'_binary_celeba/'+str(n_tasks))
 
         mean=[x/255 for x in [125.3,123.0,113.9]]
         std=[x/255 for x in [63.0,62.1,66.7]]
 
         # celeba
         dat={}
-        train_dataset = CELEBATrain(root_dir='./dat/celeba/'+data_type+'/iid/train/',img_dir='./dat/celeba/data/raw/img_align_celeba/',transform=transforms.Compose([transforms.Resize(size=(32,32)),transforms.ToTensor(),transforms.Normalize(mean,std)]))
+        train_dataset = CELEBATrain(root_dir='./data/celeba/'+data_type+'/iid/train/',img_dir='./data/celeba/data/raw/img_align_celeba/',transform=transforms.Compose([transforms.Resize(size=(32,32)),transforms.ToTensor(),transforms.Normalize(mean,std)]))
         dat['train'] = train_dataset
 
-        test_dataset = CELEBATest(root_dir='./dat/celeba/'+data_type+'/iid/test/',img_dir='./dat/celeba/data/raw/img_align_celeba/',transform=transforms.Compose([transforms.Resize(size=(32,32)),transforms.ToTensor(),transforms.Normalize(mean,std)]))
+        test_dataset = CELEBATest(root_dir='./data/celeba/'+data_type+'/iid/test/',img_dir='./data/celeba/data/raw/img_align_celeba/',transform=transforms.Compose([transforms.Resize(size=(32,32)),transforms.ToTensor(),transforms.Normalize(mean,std)]))
         dat['test'] = test_dataset
 
         users = [x[0] for x in set([user for user,image,target in torch.utils.data.DataLoader(dat['train'],batch_size=1,shuffle=True)])]
@@ -195,8 +195,8 @@ def read_celeba(seed=0,pc_valid=0.10,args=0):
             for s in ['train','test']:
                 data[n][s]['x']=torch.stack(data[n][s]['x']).view(-1,size[0],size[1],size[2])
                 data[n][s]['y']=torch.LongTensor(np.array(data[n][s]['y'],dtype=int)).view(-1)
-                torch.save(data[n][s]['x'], os.path.join(os.path.expanduser('./dat/'+data_type+'_binary_celeba/'+str(n_tasks)),'data'+str(n)+s+'x.bin'))
-                torch.save(data[n][s]['y'], os.path.join(os.path.expanduser('./dat/'+data_type+'_binary_celeba/'+str(n_tasks)),'data'+str(n)+s+'y.bin'))
+                torch.save(data[n][s]['x'], os.path.join(os.path.expanduser('./data/'+data_type+'_binary_celeba/'+str(n_tasks)),'data'+str(n)+s+'x.bin'))
+                torch.save(data[n][s]['y'], os.path.join(os.path.expanduser('./data/'+data_type+'_binary_celeba/'+str(n_tasks)),'data'+str(n)+s+'y.bin'))
 
 
     # number of example
@@ -212,8 +212,8 @@ def read_celeba(seed=0,pc_valid=0.10,args=0):
         data[i] = dict.fromkeys(['name','ncla','train','test'])
         for s in ['train','test']:
             data[i][s]={'x':[],'y':[]}
-            data[i][s]['x']=torch.load(os.path.join(os.path.expanduser('./dat/'+data_type+'_binary_celeba/'+str(n_tasks)),'data'+str(ids[i])+s+'x.bin'))
-            data[i][s]['y']=torch.load(os.path.join(os.path.expanduser('./dat/'+data_type+'_binary_celeba/'+str(n_tasks)),'data'+str(ids[i])+s+'y.bin'))
+            data[i][s]['x']=torch.load(os.path.join(os.path.expanduser('./data/'+data_type+'_binary_celeba/'+str(n_tasks)),'data'+str(ids[i])+s+'x.bin'))
+            data[i][s]['y']=torch.load(os.path.join(os.path.expanduser('./data/'+data_type+'_binary_celeba/'+str(n_tasks)),'data'+str(ids[i])+s+'y.bin'))
         data[i]['ncla']=len(np.unique(data[i]['train']['y'].numpy()))
         data[i]['name']='celeba-'+str(ids[i])
 
