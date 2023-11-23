@@ -15,7 +15,10 @@ import random
 from copy import deepcopy
 
 from scipy.stats import wasserstein_distance
+from scipy.spatial.distance import euclidean
 
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 def init_weights(m):
     if type(m) == nn.Linear or type(m) == nn.Conv2d or type(m) == Linear:
@@ -56,7 +59,7 @@ class MLPNet(nn.Module):
     def __init__(self, n_hidden=100, n_outputs=10, taskcla=None):
         super(MLPNet, self).__init__()
         self.act = OrderedDict()
-        self.lin1 = Linear(784, n_hidden, n_hidden, bias=False)
+        self.lin1 = Linear(28*28, n_hidden, n_hidden, bias=False)
         self.lin2 = Linear(n_hidden, n_hidden, n_hidden, bias=False)
         self.fc1 = torch.nn.ModuleList()
         self.taskcla = taskcla
@@ -83,51 +86,38 @@ class MLPNet(nn.Module):
         return self.fc1[t](x)
 
 
-def contrast_cls(data, every_task_base, sim_tasks,
-                 sim_scores, model, task_id, device):
+def contrast_cls(every_task_base, sim_tasks, model, task_id, device):
     l2 = 0
     cnt = 0
-    list_keys = list(model.act.keys())
+    stride_list = [1, 1, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1]
+
+    ttt = 0
     for k, (m, params) in enumerate(model.named_parameters()):
-        sim = []
-        if 'fc1' in m:
-            break
-
-        for tt in range(task_id):
+        if 'fc' not in m:
             sz = params.size(0)
-            tmp = torch.FloatTensor(every_task_base[tt][cnt]).to(device)
-            norm_project = torch.mm(tmp, tmp.transpose(1, 0)).to(device)
-            if "conv" in m:
-                proj_weight = torch.mm(params.view(sz, -1),
-                                       norm_project).view(params.size())
-            else:
-                proj_weight = torch.mm(params, norm_project)
-            sim.append(proj_weight)
-            dis = list(set(range(task_id)) - set(sim_tasks[cnt]))
-            if len(dis)  == 0:
-                break
-            tt = random.sample(dis, 1)[0]
-            tmp = torch.FloatTensor(every_task_base[tt][cnt]).to(device)
-            norm_project = torch.mm(tmp, tmp.transpose(1, 0))
-            proj_weight = torch.mm(params.view(sz, -1),
-                                    norm_project).view(params.size())
-            sim.append(proj_weight)
-            if len(sim) >= 4:
-                break
+            current_base = torch.FloatTensor(every_task_base[task_id-1][cnt]).to(device)
+            norm_project = torch.mm(current_base, current_base.transpose(1, 0))
+            current_proj_weight = torch.mm(params.view(sz, -1),
+                                        norm_project).view(params.size())
+            loss = []
+            for tt in sim_tasks[cnt-ttt]:
+                tmp = torch.FloatTensor(every_task_base[tt][cnt]).to(device)
+                norm_project = torch.mm(tmp, tmp.transpose(1, 0))
+                sim_proj_weight = torch.mm(params.view(sz, -1),
+                                        norm_project).view(params.size())
+                
+                if current_proj_weight.view(sz, -1).shape[0] != sim_proj_weight.view(sz, -1).shape[0] \
+                    or current_proj_weight.view(sz, -1).shape[1] != sim_proj_weight.view(sz, -1).shape[1]:
+                    continue
 
-        sim = torch.stack(sim).view(4, -1)
-        idxs = torch.arange(0, sim.shape[0], device=device)
-        y_true = idxs + 1 - idxs % 2 * 2
-        similarities = F.cosine_similarity(sim.unsqueeze(1), sim.unsqueeze(0), dim=2)
-
-        similarities = similarities - torch.eye(sim.shape[0], device=device) * 1e12
-        similarities = similarities / 0.05
-
-        loss = F.cross_entropy(similarities, y_true)
-        l2 += torch.mean(loss)
-
+                cos_sim = torch.nn.functional.cosine_similarity(current_proj_weight.view(sz, -1),sim_proj_weight.view(sz, -1), dim=1)
+                cos_sim = (torch.mean(cos_sim) + 1.0) / 2.0 
+                label = torch.ones(1).to(device)
+                loss.append(torch.nn.functional.binary_cross_entropy(cos_sim.view(1), label))
+            if len(loss) != 0:
+                loss = torch.mean(torch.stack(loss))
+                l2 += loss
         cnt += 1
-
     return l2
 
 
@@ -143,7 +133,7 @@ def train(args, epoch, task_id, model, device, x, y, optimizer, criterion):
         else:
             b = r[i:]
         b = b.to(x.device)
-        data = x[b].view(-1, 784)
+        data = x[b].view(-1, 28*28)
         data, target = data.to(device), y[b].to(device)
         optimizer.zero_grad()
         output = model(data, task_id, None, -1)
@@ -152,7 +142,7 @@ def train(args, epoch, task_id, model, device, x, y, optimizer, criterion):
         optimizer.step()
 
 
-def train_projected(args, p, model, device, x, y, optimizer, criterion, feature_mat, task_id, epoch, sim_tasks, sim_scores, every_task_base):
+def train_projected(args, p, model, device, x, y, optimizer, criterion, feature_mat, task_id, epoch, sim_tasks,  every_task_base):
     model.train()
     r = np.arange(x.size(0))
     np.random.shuffle(r)
@@ -164,15 +154,15 @@ def train_projected(args, p, model, device, x, y, optimizer, criterion, feature_
         else:
             b = r[i:]
         b = b.to(x.device)
-        data = x[b].view(-1, 784)
+        data = x[b].view(-1, 28*28)
         data, target = data.to(device), y[b].to(device)
         optimizer.zero_grad()
         output = model(data, task_id, p, epoch=epoch + i)
         loss = criterion(output, target)
 
         if len(sim_tasks) != 0:
-            l2 = contrast_cls(data, every_task_base, sim_tasks,
-                              sim_scores, model, task_id, device)
+            l2 = contrast_cls(every_task_base, sim_tasks,
+                               model, task_id, device)
             loss += l2
 
         loss.backward()
@@ -206,7 +196,7 @@ def test(args, model, device, x, y, criterion, id=None):
             else:
                 b = r[i:]
             b = b.to(x.device)
-            data = x[b].view(-1, 784)
+            data = x[b].view(-1, 28*28)
             data, target = data.to(device), y[b].to(device)
             output = model(data, id, None, -1)
             loss = criterion(output, target)
@@ -233,12 +223,12 @@ def get_representation_matrix(task_id, net, device, x, y, old_task_distribution)
         b = np.random.choice(size, 300, replace=True)
     
     print(x[b].shape)
-    tmp_data = x[b].view(-1, 784).to(device)
+    tmp_data = x[b].view(-1, 28*28).to(device)
     target = y[b]
     example_data.append(tmp_data)
 
     example_data = torch.cat(example_data, dim=0).squeeze(1)
-    example_data = example_data.view(-1, 784)
+    example_data = example_data.view(-1, 28*28)
     net.eval()
     example_out = net(example_data, task_id, None, -1)
 
@@ -269,6 +259,7 @@ def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, 
         for i in range(len(mat_list)):
             activation = mat_list[i]
             U, S, Vh = np.linalg.svd(activation, full_matrices=False)
+
             sval_total = (S**2).sum()
             sval_ratio = (S**2) / sval_total
             r = np.sum(np.cumsum(sval_ratio) < threshold[i])  # +1
@@ -288,6 +279,7 @@ def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, 
                 np.dot(feature_list[i], feature_list[i].transpose()),
                 activation)
             U, S, Vh = np.linalg.svd(act_hat, full_matrices=False)
+
             sval_hat = (S**2).sum()
             sval_ratio = (S**2) / sval_total
             accumulated_sval = (sval_total - sval_hat) / sval_total
@@ -324,14 +316,95 @@ def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, 
     return feature_list
 
 
+
+def update_task_discrimination(task_id, feature_list_ori, feature_list_new, threshold=0.7):
+
+    #计算训练后的下一个任务和原任务的距离
+    distance_ori = []
+    for t in range(task_id):
+        distance_ori.append(
+            wasserstein_distance(
+                feature_list_ori[task_id].flatten(), feature_list_ori[t].flatten()
+            )
+        )
+    distance_new = []
+    for t in range(task_id):
+        distance_new.append(
+            wasserstein_distance(
+                feature_list_new[t].flatten(), feature_list_new[t].flatten()
+            )
+        )
+
+    distance_ori_np = np.array(distance_ori)
+    distance_new_np = np.array(distance_new)
+
+    dis = np.abs((distance_ori_np - distance_new_np))
+    indices = np.where(dis < 0.1)
+    factors = 10 ** (np.ceil(-np.log10(dis[indices])) -1)
+    dis[indices] *= factors
+
+    sim_flag_1 = distance_new_np < distance_ori_np
+    sim_flag_2 = dis > threshold
+    sim_flag = sim_flag_1 * sim_flag_2
+
+    sim_tasks= np.where(sim_flag)[0]
+    if len(sim_tasks) > 2:
+        sim_tasks = sim_tasks[np.argsort(dis[sim_tasks])[:-2]]
+    return sim_tasks
+
+
+def update_task_discrimination_euclidean(task_id, feature_list_ori, feature_list_new, threshold=0.7):
+
+    #计算训练后的下一个任务和原任务的距离
+    distance_ori = []
+    for t in range(task_id):
+        distance_ori.append(
+            euclidean(
+                feature_list_ori[task_id].flatten(), feature_list_ori[t].flatten()
+            )
+        )
+    distance_new = []
+    for t in range(task_id):
+        distance_new.append(
+            euclidean(
+                feature_list_new[t].flatten(), feature_list_new[t].flatten()
+            )
+        )
+
+    distance_ori_np = np.array(distance_ori)
+    distance_new_np = np.array(distance_new)
+
+    dis = np.abs((distance_ori_np - distance_new_np))
+    indices = np.where(dis < 0.1)
+    factors = 10 ** (np.ceil(-np.log10(dis[indices])) -1)
+    dis[indices] *= factors
+
+    sim_flag_1 = distance_new_np < distance_ori_np
+    sim_flag_2 = dis > threshold
+    sim_flag = sim_flag_1 * sim_flag_2
+
+    sim_tasks= np.where(sim_flag)[0]
+    if len(sim_tasks) > 2:
+        sim_tasks = sim_tasks[np.argsort(dis[sim_tasks])[-2:]]
+    return sim_tasks
+
+def set_seed(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main(args):
     tstart = time.time()
     # Device Setting
     device = torch.device("cuda:{}".format(args.cuda)
                           if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
 
+    set_seed(args.seed)
     from dataloader import mixemnist as mes
 
     data,taskcla,inputsize=mes.get(seed=args.seed, args=args )
@@ -444,60 +517,29 @@ def main(args):
 
         else:
 
-            sim_tasks = []
-            sim_scores = []
+            sim_tasks = [[] for i in range(3)]
+            _ = get_representation_matrix(
+                task_id, model, device, xtrain, ytrain, old_task_distribution)
+            cnt = 0
+            for kk, (m, params) in enumerate(model.named_parameters()):
+                if len(params.size()) != 1 and 'fc' not in m:
+                    pre_tmp = []
+                    old_tmp = []
+                    for ttt in range(task_id+1):
+                        pre_tmp.append(pre_task_distribution[ttt][cnt][0])
+                        old_tmp.append(old_task_distribution[ttt][cnt][0])
+                    sim_tasks[cnt] = update_task_discrimination_euclidean(task_id, pre_tmp, old_tmp, threshold=0.7)
+                    cnt += 1
 
-            if task_id >= 1:
-                sim_tasks = [i for i in range(3)]
-                sim_scores = [i for i in range(3)]
-                _ = get_representation_matrix(
-                    task_id, model, device, xtrain, ytrain, old_task_distribution)
-                distribution = [[[]
-                                 for j in range(task_id)] for i in range(3)]
-
-                cnt = 0
-                beta = 0.5
-                for kk, (m, params) in enumerate(model.named_parameters()):
-                    if len(params.size()) != 1 and kk < 3:
-                        for tt in range(task_id):
-
-                            a = wasserstein_distance(
-                                old_task_distribution[tt][cnt][0], old_task_distribution[task_id][cnt][0])
-                            distribution[cnt][tt] =  a
-                        cnt += 1
-                cnt = 0
-
-                for kk, (m, params) in enumerate(model.named_parameters()):
-                    if len(params.size()) != 1 and kk < 3:
-                        sim_scores[cnt] = []
-                        for tt in range(task_id):
-
-                            t = wasserstein_distance(
-                                pre_task_distribution[tt][cnt][0], pre_task_distribution[task_id][cnt][0])
-                            if t <= distribution[cnt][tt]:
-                                distribution[cnt][tt] = 1000
-                                sim_scores[cnt].append(0)
-                            else:
-
-                                sim_scores[cnt].append(torch.cosine_similarity(torch.FloatTensor(pre_task_distribution[tt][cnt][0]).to(device), torch.FloatTensor(pre_task_distribution[task_id][cnt][0]).to(device), dim=0).cpu().numpy())
-                        cnt += 1
-
-                for i in range(3):
-                    print(sim_scores[i])
-
-                for idx, ii in enumerate(sim_scores):
-                    sim_tasks[idx] = [i for i,j in enumerate(ii) if j > 0.2][:4]
-                print(sim_tasks)
-
-                print("*" * 40)
-                print("Task {} has sim Tasks".format(task_id), end="")
-                cnt = 0
-                for kk, (m, params) in enumerate(model.named_parameters()):
-                    if len(params.size()) != 1 and kk < 4:
-                        print("Layer: {}".format(cnt))
-                        print(sim_tasks[cnt], sim_scores[cnt])
-                        cnt += 1
-                print("*" * 40)
+            print("*" * 40)
+            print("Task {} has sim Tasks".format(task_id), end="")
+            cnt = 0
+            for kk, (m, params) in enumerate(model.named_parameters()):
+                if len(params.size()) != 1 and 'fc' not in m:
+                    print("Layer: {}".format(cnt))
+                    print(sim_tasks[cnt])
+                    cnt += 1
+            print("*" * 40)
 
             optimizer = optim.SGD(model.parameters(),
                                   lr=args.lr, momentum=args.momentum)
@@ -522,7 +564,7 @@ def main(args):
 
                 clock0 = time.time()
                 train_projected(args, p, model, device, xtrain,
-                                ytrain, optimizer, criterion, feature_mat, k, epoch, sim_tasks, sim_scores, every_task_base)
+                                ytrain, optimizer, criterion, feature_mat, k, epoch, sim_tasks,  every_task_base)
                 clock1 = time.time()
                 tr_loss, tr_acc = test(args, model, device, xtrain, ytrain,
                                        criterion, task_id)
@@ -657,8 +699,6 @@ if __name__ == "__main__":
     parser.add_argument('--idrandom',default=3,type=int,required=False,help='(default=%(default)d)')
     parser.add_argument('--data_size',default='small',type=str,required=False,help='(default=%(default)s)')
     parser.add_argument("--num_class_femnist",default=62,type=int,required=False,help='(default=%(default)d)')
-
-
     args = parser.parse_args()
     print('=' * 100)
     print('Arguments =')

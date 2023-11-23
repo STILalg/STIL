@@ -1,6 +1,7 @@
 import os,sys
 import numpy as np
 import torch
+# import utils
 from torchvision import datasets,transforms
 from sklearn.utils import shuffle
 
@@ -10,7 +11,6 @@ import pickle
 import random
 import matplotlib.pyplot as plt
 
-# Load CIFAR100 Superclass dataset
 def cifar100_superclass_python(task_order, group=5, validation=False, val_ratio=0.05, flat=False, one_hot=True, seed = 0 ):
     CIFAR100_LABELS_LIST = [
         'apple', 'aquarium_fish', 'baby', 'bear', 'beaver', 'bed', 'bee', 'beetle',

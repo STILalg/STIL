@@ -9,64 +9,30 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sn
 import pandas as pd
-import random
 import argparse
 import time
+import random
 from copy import deepcopy
 
 from scipy.stats import wasserstein_distance
 from scipy.spatial.distance import euclidean
-all_scores = []
-# Define AlexNet model
-def compute_conv_output_size(Lin,
-                             kernel_size,
-                             stride=1,
-                             padding=0,
-                             dilation=1):
-    return int(
-        np.floor((Lin + 2 * padding - dilation *
-                  (kernel_size - 1) - 1) / float(stride) + 1))
+
+def init_weights(m):
+    if type(m) == nn.Linear or type(m) == nn.Conv2d or type(m) == Linear:
+        torch.nn.init.kaiming_uniform_(
+            m.weight, mode='fan_in', nonlinearity='relu')
 
 
-class Conv2d(nn.Conv2d):
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size,
-                 padding=0,
-                 stride=1,
-                 dilation=1,
-                 groups=1,
-                 bias=True):
-        super(Conv2d, self).__init__(in_channels,
-                                     out_channels,
-                                     kernel_size,
-                                     stride=stride,
-                                     padding=padding,
-                                     bias=bias)
-
-    def forward(self, input, task_id, p, epoch):
-
-        if p is not None:
-            if epoch == 1:
-                sz = self.weight.size(0)
-                norm_project = torch.mm(p, p.transpose(1, 0))
-                #[chout, chinxkxk]  [chinxkxk, chinxkxk]
-                proj_weight = torch.mm(self.weight.view(sz, -1),
-                                       norm_project).view(self.weight.size())
-                masked_weight = self.weight - proj_weight
-            else:
-                masked_weight = self.weight
+def adjust_learning_rate(optimizer, epoch, args):
+    for param_group in optimizer.param_groups:
+        if (epoch == 1):
+            param_group['lr'] = args.lr
         else:
-            masked_weight = self.weight
-
-        return F.conv2d(input, masked_weight, self.bias, self.stride,
-                        self.padding, self.dilation, self.groups)
+            param_group['lr'] /= args.lr_factor
 
 
-# Define specific linear layer
 class Linear(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, norm_feature, bias=True):
         super(Linear, self).__init__(in_features, out_features, bias=bias)
 
     def forward(self, input, task_id, p, epoch):
@@ -81,188 +47,73 @@ class Linear(nn.Linear):
                 masked_weight = self.weight
         else:
             masked_weight = self.weight
-        return F.linear(input, masked_weight, self.bias)
+        x = F.linear(input, masked_weight, self.bias)
+        return x
 
 
-class AlexNet(nn.Module):
-    def __init__(self, taskcla):
-        super(AlexNet, self).__init__()
+# Define MLP model
+class MLPNet(nn.Module):
+    def __init__(self, n_hidden=100, n_outputs=10):
+        super(MLPNet, self).__init__()
         self.act = OrderedDict()
-        self.map = []
-        self.ksize = []
-        self.in_channel = []
-        self.map.append(32)
-        self.conv1 = Conv2d(3, 64, 4, bias=False)
-        s = compute_conv_output_size(32, 4)
-        self.ln1 = nn.BatchNorm2d(64, track_running_stats=False)
-        s = s // 2
-        self.ksize.append(4)
-        self.in_channel.append(3)
-        self.map.append(s)
-        self.conv2 = Conv2d(64, 128, 3, bias=False)
-        s = compute_conv_output_size(s, 3)
-        self.ln2 = nn.BatchNorm2d(128, track_running_stats=False)
-        s = s // 2
-        self.ksize.append(3)
-        self.in_channel.append(64)
-        self.map.append(s)
-        self.conv3 = Conv2d(128, 256, 2, bias=False)
-        s = compute_conv_output_size(s, 2)
-        self.bn3 = nn.BatchNorm2d(256, track_running_stats=False)
-        s = s // 2
-        self.smid = s
-        self.ksize.append(2)
-        self.in_channel.append(128)
-        self.map.append(256 * self.smid * self.smid)
-        self.maxpool = torch.nn.MaxPool2d(2)
-        self.relu = nn.ReLU()
-        self.drop1 = torch.nn.Dropout(0.2)
-        self.drop2 = torch.nn.Dropout(0.5)
+        self.lin1 = Linear(3*32*32, n_hidden, n_hidden, bias=False)
+        self.lin2 = Linear(n_hidden, n_hidden, n_hidden, bias=False)
+        self.fc1 = Linear(n_hidden, n_outputs, n_outputs, bias=False)
 
-        self.fc1 = Linear(256 * self.smid * self.smid, 4096, bias=False)
-        self.ln4 = nn.BatchNorm1d(4096, track_running_stats=False)
-        self.fc2 = Linear(4096, 4096, bias=False)
-        self.ln5 = nn.BatchNorm1d(4096, track_running_stats=False)
-        self.map.extend([4096])
-
-        self.taskcla = taskcla
-        self.fc3 = torch.nn.ModuleList()
-        for t, n in self.taskcla:
-            self.fc3.append(nn.Linear(4096, n, bias=False))
-
-        self.backup = {}
-
-    def forward(self,  x, t, p, epoch):
+    def forward(self, x, t, p, epoch):
         if p is None:
-            bsz = deepcopy(x.size(0))
-            self.act['conv1'] = x
-            x = self.conv1(x, t, None, epoch)
-            x = self.maxpool(self.drop1(self.relu(self.ln1(x))))
-
-            self.act['conv2'] = x
-            x = self.conv2(x, t, None, epoch)
-            x = self.maxpool(self.drop1(self.relu(self.ln2(x))))
-
-            self.act['conv3'] = x
-            x = self.conv3(x, t, None, epoch)
-            x = self.maxpool(self.drop2(self.relu(self.bn3(x))))
-
-            x = x.view(bsz, -1)
+            self.act['Lin1'] = x
+            x = self.lin1(x, t, None, epoch)
+            x = F.relu(x)
+            self.act['Lin2'] = x
+            x = self.lin2(x, t, None, epoch)
+            x = F.relu(x)
             self.act['fc1'] = x
             x = self.fc1(x, t, None, epoch)
-            x = self.drop2(self.relu(self.ln4(x)))
-
-            self.act['fc2'] = x
-            x = self.fc2(x, t, None, epoch)
-            x = self.drop2(self.relu(self.ln5(x)))
-            y = []
-            for t, i in self.taskcla:
-                y.append(self.fc3[t](x))
         else:
-            bsz = deepcopy(x.size(0))
-            self.act['conv1'] = x
-            x = self.conv1(x, t, p[0], epoch)
-            x = self.maxpool(self.drop1(self.relu(self.ln1(x))))
-
-            self.act['conv2'] = x
-            x = self.conv2(x, t, p[1], epoch)
-            x = self.maxpool(self.drop1(self.relu(self.ln2(x))))
-
-            self.act['conv3'] = x
-            x = self.conv3(x, t, p[2], epoch)
-            x = self.maxpool(self.drop2(self.relu(self.bn3(x))))
-
-            x = x.view(bsz, -1)
+            self.act['Lin1'] = x
+            x = self.lin1(x, t, p[0], epoch)
+            x = F.relu(x)
+            self.act['Lin2'] = x
+            x = self.lin2(x, t, p[1], epoch)
+            x = F.relu(x)
             self.act['fc1'] = x
-            x = self.fc1(x, t, p[3], epoch)
-            x = self.drop2(self.relu(self.ln4(x)))
-
-            self.act['fc2'] = x
-            x = self.fc2(x, t, p[4], epoch)
-            x = self.drop2(self.relu(self.ln5(x)))
-            y = []
-            for t, i in self.taskcla:
-                y.append(self.fc3[t](x))
-        return y
+            x = self.fc1(x, t, p[2], epoch)
+        return x
 
 
-def get_model(model):
-    return deepcopy(model.state_dict())
-
-
-def set_model_(model, state_dict):
-    model.load_state_dict(deepcopy(state_dict))
-    return
-
-
-def adjust_learning_rate(optimizer, epoch, args):
-    for param_group in optimizer.param_groups:
-        if (epoch == 1):
-            param_group['lr'] = args.lr
-        else:
-            param_group['lr'] /= args.lr_factor
-
-
-def train(args, epoch, task_id, model, device, x, y, optimizer, criterion):
-    '''Train for one epoch on the training set'''
-    model.train()
-    r = np.arange(x.size(0))
-    np.random.shuffle(r)
-    r = torch.LongTensor(r).to(device)
-    # Loop batches
-    for i in range(0, len(r), args.batch_size_train):
-        if i+args.batch_size_train <= len(r):
-            b = r[i:i+args.batch_size_train]
-        else:
-            b = r[i:]
-        b = b.to(x.device)
-        data = x[b]
-        data, target = data.to(device), y[b].to(device)
-        optimizer.zero_grad()
-        output = model(data, task_id, None, -1)
-        loss = criterion(output[task_id], target)
-        loss.backward()
-        optimizer.step()
-
-
-def contrast_cls(every_task_base, sim_tasks, model, task_id, device,):
+def contrast_cls(every_task_base, sim_tasks, model, task_id, device):
     l2 = 0
     cnt = 0
+    stride_list = [1, 1, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1]
 
     ttt = 0
     for k, (m, params) in enumerate(model.named_parameters()):
-
-        if k < 15 and len(params.size()) != 1:
+        if 'fc' not in m:
             sz = params.size(0)
             current_base = torch.FloatTensor(every_task_base[task_id-1][cnt]).to(device)
             norm_project = torch.mm(current_base, current_base.transpose(1, 0))
             current_proj_weight = torch.mm(params.view(sz, -1),
-                                       norm_project).view(params.size())
+                                        norm_project).view(params.size())
             loss = []
             for tt in sim_tasks[cnt-ttt]:
-                
-
-                
                 tmp = torch.FloatTensor(every_task_base[tt][cnt]).to(device)
                 norm_project = torch.mm(tmp, tmp.transpose(1, 0))
                 sim_proj_weight = torch.mm(params.view(sz, -1),
-                                       norm_project).view(params.size())
+                                        norm_project).view(params.size())
                 cos_sim = torch.nn.functional.cosine_similarity(current_proj_weight.view(sz, -1),sim_proj_weight.view(sz, -1), dim=1)
                 cos_sim = (torch.mean(cos_sim) + 1.0) / 2.0 
                 label = torch.ones(1).to(device)
-
                 loss.append(torch.nn.functional.binary_cross_entropy(cos_sim.view(1), label))
             if len(loss) != 0:
                 loss = torch.mean(torch.stack(loss))
                 l2 += loss
-            cnt += 1
-
+        cnt += 1
     return l2
 
 
-def train_projected(args, p, model, device, x, y, optimizer, criterion, feature_mat, task_id, epoch, sim_tasks,  every_task_base):
 
-
+def train(args, epoch, task_id, model, device, x, y, optimizer, criterion):
     model.train()
     r = np.arange(x.size(0))
     np.random.shuffle(r)
@@ -273,12 +124,31 @@ def train_projected(args, p, model, device, x, y, optimizer, criterion, feature_
             b = r[i:i+args.batch_size_train]
         else:
             b = r[i:]
-        b = b.to(x.device)
-        data = x[b]
+        data = x[b].view(-1, 3*32*32)
         data, target = data.to(device), y[b].to(device)
         optimizer.zero_grad()
-        output = model(data, task_id, p, epoch + i)
-        loss = criterion(output[task_id], target)
+        output = model(data, task_id, None, -1)
+        loss = criterion(output, target)
+        loss.backward()
+        optimizer.step()
+
+
+def train_projected(args, p, model, device, x, y, optimizer, criterion, feature_mat, task_id, epoch, sim_tasks,  every_task_base):
+    model.train()
+    r = np.arange(x.size(0))
+    np.random.shuffle(r)
+    r = torch.LongTensor(r).to(device)
+    # Loop batches
+    for i in range(0, len(r), args.batch_size_train):
+        if i+args.batch_size_train <= len(r):
+            b = r[i:i+args.batch_size_train]
+        else:
+            b = r[i:]
+        data = x[b].view(-1, 3*32*32)
+        data, target = data.to(device), y[b].to(device)
+        optimizer.zero_grad()
+        output = model(data, task_id, p, epoch=epoch + i)
+        loss = criterion(output, target)
 
         if len(sim_tasks) != 0:
             l2 = contrast_cls(every_task_base, sim_tasks,
@@ -286,21 +156,21 @@ def train_projected(args, p, model, device, x, y, optimizer, criterion, feature_
             loss += l2
 
         loss.backward()
-
-        kk = 0
         # Gradient Projections
+        kk = 0
         for k, (m, params) in enumerate(model.named_parameters()):
-            if k < 15 and len(params.size()) != 1:
-                sz = params.size(0)
+            if k < 3 and len(params.size()) != 1:
+                sz = params.grad.data.size(0)
                 params.grad.data = params.grad.data - torch.mm(params.grad.data.view(sz, -1),
                                                                feature_mat[kk]).view(params.size())
                 kk += 1
-            elif (k < 15 and len(params.size()) == 1) and task_id != 0:
+            elif (k < 3 and len(params.size()) == 1) and task_id != 0:
                 params.grad.data.fill_(0)
+
         optimizer.step()
 
 
-def test(args, model, device, x, y, criterion, task_id):
+def test(args, model, device, x, y, criterion, id=None):
     model.eval()
     total_loss = 0
     total_num = 0
@@ -315,12 +185,11 @@ def test(args, model, device, x, y, criterion, task_id):
                 b = r[i:i + args.batch_size_test]
             else:
                 b = r[i:]
-            b = b.to(x.device)
-            data = x[b]
+            data = x[b].view(-1, 3*32*32)
             data, target = data.to(device), y[b].to(device)
-            output = model(data, task_id, None, -1)
-            loss = criterion(output[task_id], target)
-            pred = output[task_id].argmax(dim=1, keepdim=True)
+            output = model(data, -1, None, -1)
+            loss = criterion(output, target)
+            pred = output.argmax(dim=1, keepdim=True)
 
             correct += pred.eq(target.view_as(pred)).sum().item()
             total_loss += loss.data.cpu().numpy().item() * len(b)
@@ -336,57 +205,30 @@ def get_representation_matrix(task_id, net, device, x, y, old_task_distribution)
     r = np.arange(x.size(0))
     np.random.shuffle(r)
     r = torch.LongTensor(r).to(device)
-    un = torch.unique(y)
-    idx = 0
-    for _ in range(13):
-        b = []
-        for i in un:
-            while y[idx] != i:
-                idx += 1
-            b.append(idx)
-        assert len(b) == 10
-        tmp_data = x[b].to(device)
-        target = y[b]
-        example_data.append(tmp_data)
-
-    example_data = torch.cat(example_data, dim=0)
-    net.eval()
+    b=r[0:15] # Take random training samples
+    example_data = x[b].view(-1,3*32*32)
+    example_data = example_data.to(device)
     example_out = net(example_data, task_id, None, -1)
 
-    batch_list = [2 * 12, 100, 100, 125, 125]
-    mat_list = []
+    batch_list = [15, 15, 15]
+    mat_list = []  # list contains representation matrix of each layer
     act_key = list(net.act.keys())
-    for i in range(len(net.map)):
+
+    for i in range(len(act_key)):
         bsz = batch_list[i]
-        k = 0
-        if i < 3:
-            ksz = net.ksize[i]
-            s = compute_conv_output_size(net.map[i], net.ksize[i])
-            mat = np.zeros(
-                (net.ksize[i] * net.ksize[i] * net.in_channel[i], s * s * bsz))
-            act = net.act[act_key[i]].detach().cpu().numpy()
-            for kk in range(bsz):
-                for ii in range(s):
-                    for jj in range(s):
-                        mat[:, k] = act[kk, :, ii:ksz + ii,
-                                        jj:ksz + jj].reshape(-1)
-                        k += 1
-            mat_list.append(mat)
-            old_task_distribution[task_id][i].append(deepcopy(mat.flatten()))
-        else:
-            act = net.act[act_key[i]].detach().cpu().numpy()
-            activation = act[0:bsz].transpose()
-            mat_list.append(activation)
-            old_task_distribution[task_id][i].append(deepcopy(activation.flatten()))
+        act = net.act[act_key[i]].detach().cpu().numpy()
+        activation = act[0:bsz].transpose()
+        mat_list.append(activation)
+        old_task_distribution[task_id][i].append(
+            deepcopy(activation.flatten()))
 
-    print('-' * 30)
+    print('-'*30)
     print('Representation Matrix')
-    print('-' * 30)
+    print('-'*30)
     for i in range(len(mat_list)):
-        print('Layer {} : {}'.format(i + 1, mat_list[i].shape))
-    print('-' * 30)
+        print('Layer {} : {}'.format(i+1, mat_list[i].shape))
+    print('-'*30)
     return mat_list
-
 
 def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, every_task_base=None):
     print('Threshold: ', threshold)
@@ -395,10 +237,9 @@ def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, 
         for i in range(len(mat_list)):
             activation = mat_list[i]
             U, S, Vh = np.linalg.svd(activation, full_matrices=False)
-
             sval_total = (S**2).sum()
-            sval_ratio = (S**2)/sval_total
-            r = np.sum(np.cumsum(sval_ratio) < threshold[i])  # +1
+            sval_ratio = (S**2) / sval_total
+            r = np.sum(np.cumsum(sval_ratio) < threshold[i])
             feature_list.append(U[:, 0:r])
             proj[task_id][i] = U[:, 0:r]
             every_task_base[task_id][i] = U[:, 0:r]
@@ -408,17 +249,16 @@ def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, 
             U1, S1, Vh1 = np.linalg.svd(activation, full_matrices=False)
             sval_total = (S1**2).sum()
             sval_ratio = (S1**2)/sval_total
-            r = np.sum(np.cumsum(sval_ratio) < threshold[i])  # +1
+            r = np.sum(np.cumsum(sval_ratio) < threshold[i])
             every_task_base[task_id][i] = U1[:, 0:r]
 
-            act_hat = activation - \
-                np.dot(
-                    np.dot(feature_list[i], feature_list[i].transpose()), activation)
+            act_hat = activation - np.dot(
+                np.dot(feature_list[i], feature_list[i].transpose()),
+                activation)
             U, S, Vh = np.linalg.svd(act_hat, full_matrices=False)
-
             sval_hat = (S**2).sum()
-            sval_ratio = (S**2)/sval_total
-            accumulated_sval = (sval_total-sval_hat)/sval_total
+            sval_ratio = (S**2) / sval_total
+            accumulated_sval = (sval_total - sval_hat) / sval_total
 
             r = 0
             for ii in range(sval_ratio.shape[0]):
@@ -428,11 +268,12 @@ def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, 
                 else:
                     break
             if r != 0:
-                print('Not Skip Updating GPM for layer: {}'.format(i + 1))
-
-                # update GPM
+                print('Skip Updating GPM for layer: {}'.format(i + 1))
                 Ui = np.hstack((feature_list[i], U[:, 0:r]))
                 if Ui.shape[1] > Ui.shape[0]:
+                    print('-' * 40)
+                    print('Base Matrix has OOM')
+                    print('-' * 40)
                     feature_list[i] = Ui[:, 0:Ui.shape[0]]
                 else:
                     feature_list[i] = Ui
@@ -441,15 +282,14 @@ def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, 
             else:
                 proj[task_id][i] = U[:, 0:r]
 
-    print('-'*40)
+    print('-' * 40)
     print('Gradient Constraints Summary')
-    print('-'*40)
+    print('-' * 40)
     for i in range(len(feature_list)):
-        print('Layer {} : {}/{}'.format(i+1,
-              feature_list[i].shape[1], feature_list[i].shape[0]))
-    print('-'*40)
+        print('Layer {} : {}/{}'.format(i + 1, feature_list[i].shape[1],
+                                        feature_list[i].shape[0]))
+    print('-' * 40)
     return feature_list
-
 
 def update_task_discrimination(task_id, feature_list_ori, feature_list_new, threshold=0.7):
 
@@ -522,44 +362,39 @@ def update_task_discrimination_euclidean(task_id, feature_list_ori, feature_list
         sim_tasks = sim_tasks[np.argsort(dis[sim_tasks])[-2:]]
     return sim_tasks
 
-# def set_seed(seed=0):
-#     random.seed(seed)
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
-#     torch.cuda.manual_seed(seed)
-#     torch.cuda.manual_seed_all(seed)
-#     torch.backends.cudnn.deterministic = True
-#     torch.backends.cudnn.benchmark = False
+def set_seed(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def main(args):
     tstart = time.time()
     # Device Setting
-    device = torch.device("cuda:{}".format(args.cuda)
+    device = torch.device("cuda:1"
                           if torch.cuda.is_available() else "cpu")
-    # set_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
     torch.manual_seed(args.seed)
-    from dataloader import cifar100 as cf100
-    data, taskcla, inputsize = cf100.get(seed=args.seed,
-                                         pc_valid=args.pc_valid)
+    np.random.seed(args.seed)
+    from dataloader import celeba as mes
+    data,taskcla,inputsize=mes.get(seed=args.seed, pc_valid=args.pc_valid, sim_ntasks=args.n_tasks)
 
-    n_task = 10
-    acc_matrix = np.zeros((10, 10))
+    n_task = args.n_tasks
+    acc_matrix = np.zeros((n_task, n_task))
     criterion = torch.nn.CrossEntropyLoss()
-
 
     task_id = 0
     task_list = []
 
-    model = AlexNet(taskcla).to(device)
+    model = MLPNet(args.n_hidden, args.n_outputs).to(device)
     print('Model parameters ---')
     for k_t, (m, param) in enumerate(model.named_parameters()):
         print(k_t, m, param.shape)
     print('-' * 40)
-
-    pre_task_distribution = [[[] for j in range(5)] for i in range(n_task)]
-    old_task_distribution = [[[] for j in range(5)] for i in range(n_task)]
+    pre_task_distribution = [[[] for j in range(3)] for i in range(n_task)]
+    old_task_distribution = [[[] for j in range(3)] for i in range(n_task)]
 
     task_id = 0
     print("*" * 100)
@@ -567,8 +402,7 @@ def main(args):
     for k, ncla in taskcla:
         xtrain = data[k]['train']['x']
         ytrain = data[k]['train']['y']
-        _ = get_representation_matrix(
-            task_id, model, device, xtrain, ytrain, pre_task_distribution)
+        _ = get_representation_matrix(task_id, model, device, xtrain, ytrain, pre_task_distribution)
         task_id += 1
     print("*" * 100)
     del model
@@ -580,7 +414,7 @@ def main(args):
 
     for k, ncla in taskcla:
         # specify threshold hyperparameter
-        threshold = np.array([0.97] * 5) + task_id * np.array([0.003] * 5)
+        threshold = np.array([0.95, 0.99, 0.99])
 
         print('*' * 100)
         print('Task {:2d} ({:s})'.format(k, data[k]['name']))
@@ -603,34 +437,27 @@ def main(args):
         every_task_base[task_id] = {}
 
         if task_id == 0:
-            model = AlexNet(taskcla).to(device)
-            best_model = get_model(model)
+            model = MLPNet(args.n_hidden, args.n_outputs).to(device)
             feature_list = []
             optimizer = optim.SGD(model.parameters(),
                                   lr=lr, momentum=args.momentum)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=args.n_epochs)
-
             for epoch in range(1, args.n_epochs + 1):
-                # Train
                 clock0 = time.time()
                 train(args, epoch, task_id, model, device,
                       xtrain, ytrain, optimizer, criterion)
                 clock1 = time.time()
                 tr_loss, tr_acc = test(args, model, device, xtrain, ytrain,
-                                       criterion, k)
-                print('Epoch {:3d} | Train: loss={:.3f}, acc={:5.2f}% | time={:5.2f}ms |'.format(epoch,
+                                       criterion)
+                print('Epoch {:3d} | Train: loss={:.3f}, acc={:5.1f}% | time={:5.1f}ms |'.format(epoch,
                                                                                                  tr_loss, tr_acc, 1000*(clock1-clock0)), end='')
                 # Validate
                 valid_loss, valid_acc = test(args, model, device, xvalid,
-                                             yvalid, criterion, k)
-                print(' Valid: loss={:.3f}, acc={:5.2f}% |'.format(
+                                             yvalid, criterion)
+                print(' Valid: loss={:.3f}, acc={:5.1f}% |'.format(
                     valid_loss, valid_acc),
                     end='')
-                # Adapt lr
                 if valid_loss < best_loss:
                     best_loss = valid_loss
-                    best_model = get_model(model)
                     patience = args.lr_patience
                     print(' *', end='')
                 else:
@@ -644,17 +471,14 @@ def main(args):
                         patience = args.lr_patience
                         adjust_learning_rate(optimizer, epoch, args)
                 print()
-
-            set_model_(model, best_model)
-
             # Test
             print('-' * 40)
             test_loss, test_acc = test(args, model, device, xtest, ytest,
-                                       criterion, k)
-            print('Test: loss={:.3f} , acc={:5.2f}%'.format(
+                                       criterion)
+            print('Test: loss={:.3f} , acc={:5.1f}%'.format(
                 test_loss, test_acc))
 
-            # proj Update
+            # Memory Update
             mat_list = get_representation_matrix(
                 task_id, model, device, xtrain, ytrain, old_task_distribution)
             feature_list = update_GPM(
@@ -662,25 +486,26 @@ def main(args):
 
         else:
 
-            sim_tasks = [i for i in range(5)]
+            sim_tasks = [i for i in range(3)]
             _ = get_representation_matrix(
                 task_id, model, device, xtrain, ytrain, old_task_distribution)
             cnt = 0
             for kk, (m, params) in enumerate(model.named_parameters()):
-                if len(params.size()) != 1 and kk < 15:
+                if len(params.size()) != 1 and kk < 3:
                     pre_tmp = []
                     old_tmp = []
                     for ttt in range(task_id+1):
                         pre_tmp.append(pre_task_distribution[ttt][cnt][0])
                         old_tmp.append(old_task_distribution[ttt][cnt][0])
-                    sim_tasks[cnt] = update_task_discrimination(task_id, pre_tmp, old_tmp, threshold=0.8)
+                    sim_tasks[cnt] = update_task_discrimination(task_id, pre_tmp, old_tmp, threshold=0.7)
                     cnt += 1
+
 
             print("*" * 40)
             print("Task {} has sim Tasks".format(task_id), end="")
             cnt = 0
             for kk, (m, params) in enumerate(model.named_parameters()):
-                if len(params.size()) != 1 and kk < 15:
+                if len(params.size()) != 1 and kk < 4:
                     print("Layer: {}".format(cnt))
                     print(sim_tasks[cnt])
                     cnt += 1
@@ -688,8 +513,7 @@ def main(args):
 
             optimizer = optim.SGD(model.parameters(),
                                   lr=args.lr, momentum=args.momentum)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=args.n_epochs)
+            scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
             feature_mat = []
             # Projection Matrix Precomputation
             for i in range(len(model.act)):
@@ -701,55 +525,43 @@ def main(args):
                 feature_mat.append(Uf)
             print('-' * 40)
 
-            p = [None, None, None, None, None]
+            p = [None, None, None]
             if task_id >= 1:
-                # Calculate the orthogonal direction of previous task subspace
-                for i in range(5):
-                    p[i] = torch.FloatTensor(
-                        proj[task_id-1][i]).to(device)
+                # Projection Matrix Precomputation
+                for i in range(3):
+                    p[i] = torch.Tensor(proj[task_id-1][i]).to(device)
 
             for epoch in range(1, args.n_epochs + 1):
 
                 clock0 = time.time()
+
                 train_projected(args, p, model, device, xtrain,
                                 ytrain, optimizer, criterion, feature_mat, k, epoch, sim_tasks,  every_task_base)
                 clock1 = time.time()
-
                 tr_loss, tr_acc = test(args, model, device, xtrain, ytrain,
-                                       criterion, k)
-                print('Epoch {:3d} | Train: loss={:.3f}, acc={:5.2f}% | time={:5.2f}ms |'.format(epoch,
+                                       criterion)
+                print('Epoch {:3d} | Train: loss={:.3f}, acc={:5.1f}% | time={:5.1f}ms |'.format(epoch,
                                                                                                  tr_loss, tr_acc, 1000*(clock1-clock0)), end='')
                 # Validate
                 valid_loss, valid_acc = test(args, model, device, xvalid,
-                                             yvalid, criterion, k)
-                print(' Valid: loss={:.3f}, acc={:5.2f}% |'.format(
+                                             yvalid, criterion)
+                print(' Valid: loss={:.3f}, acc={:5.1f}% |'.format(
                     valid_loss, valid_acc),
                     end='')
-                # Adapt lr
                 if valid_loss < best_loss:
                     best_loss = valid_loss
-                    best_model = get_model(model)
                     patience = args.lr_patience
                     print(' *', end='')
-                else:
-                    patience -= 1
-                    if patience <= 0:
-                        lr /= args.lr_factor
-                        print(' lr={:.1e}'.format(lr), end='')
-                        if lr < args.lr_min:
-                            print()
-                            break
-                        patience = args.lr_patience
-                        adjust_learning_rate(optimizer, epoch, args)
+                scheduler.step()
                 print()
-            set_model_(model, best_model)
+            
 
             # Test
             test_loss, test_acc = test(args, model, device, xtest, ytest,
-                                       criterion, k)
-            print('Test: loss={:.3f} , acc={:5.2f}%'.format(
+                                       criterion)
+            print('Test: loss={:.3f} , acc={:5.1f}%'.format(
                 test_loss, test_acc))
-            # proj Update
+            # Memory Update
             mat_list = get_representation_matrix(
                 task_id, model, device, xtrain, ytrain, old_task_distribution)
             feature_list = update_GPM(
@@ -761,7 +573,7 @@ def main(args):
             xtest = data[ii]['test']['x']
             ytest = data[ii]['test']['y']
             _, acc_matrix[task_id, jj] = test(args, model, device, xtest,
-                                              ytest, criterion, ii)
+                                              ytest, criterion)
             jj += 1
         print('Accuracies =')
         for i_a in range(task_id + 1):
@@ -777,86 +589,45 @@ def main(args):
     print('Final Avg Accuracy: {:5.2f}%'.format(acc_matrix[-1].mean()))
     bwt = np.mean((acc_matrix[-1] - np.diag(acc_matrix))[:-1])
     print('Backward transfer: {:5.2f}%'.format(bwt))
-    print('[Elapsed time = {:.2f} ms]'.format((time.time() - tstart) * 1000))
+    print('[Elapsed time = {:.1f} ms]'.format((time.time() - tstart) * 1000))
     print('-' * 50)
-    # Plots
 
-    for i in all_scores:
-        for j in i:
-            print(i, end=" ")
-        print()
-
-    array = acc_matrix
-    df_cm = pd.DataFrame(
-        array,
-        index=[
-            i for i in
-            ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10"]
-        ],
-        columns=[
-            i for i in
-            ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10"]
-        ])
-    sn.set(font_scale=1.4)
-    sn.heatmap(df_cm, annot=True, annot_kws={"size": 10})
-    plt.show()
 
 
 if __name__ == "__main__":
     # Training parameters
     parser = argparse.ArgumentParser(description='Sequential PMNIST with GPM')
-    parser.add_argument('--cuda', default=2, type=int,
-                        help='default GPU device')
-    parser.add_argument('--batch_size_train',
-                        type=int,
-                        default=64,
-                        metavar='N',
-                        help='input batch size for training (default: 64)')
-    parser.add_argument('--batch_size_test',
-                        type=int,
-                        default=256,
-                        metavar='N',
+    parser.add_argument('--batch_size_train', type=int, default=64, metavar='N',
+                        help='input batch size for training (default: 10)')
+    parser.add_argument('--batch_size_test', type=int, default=64, metavar='N',
                         help='input batch size for testing (default: 64)')
-    parser.add_argument('--n_epochs',
-                        type=int,
-                        default=200,
-                        metavar='N',
-                        help='number of training epochs/task (default: 200)')
-    parser.add_argument('--seed',
-                        type=int,
-                        default=1,
-                        metavar='S',
-                        help='random seed (default: 1)')
-    parser.add_argument('--pc_valid',
-                        default=0.05,
-                        type=float,
+    parser.add_argument('--n_epochs', type=int, default=50, metavar='N',
+                        help='number of training epochs/task (default: 5)')
+    parser.add_argument('--seed', type=int, default=5, metavar='S',
+                        help='random seed (default: 2)')
+    parser.add_argument('--pc_valid',default=0.05,type=float,
                         help='fraction of training data used for validation')
     # Optimizer parameters
-    parser.add_argument('--lr',
-                        type=float,
-                        default=0.01,
-                        metavar='LR',
+    parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                         help='learning rate (default: 0.01)')
-    parser.add_argument('--momentum',
-                        type=float,
-                        default=0.70,
-                        metavar='M',
+    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
-    parser.add_argument('--lr_min',
-                        type=float,
-                        default=0.5e-5,
-                        metavar='LRM',
+    parser.add_argument('--lr_min', type=float, default=1e-5, metavar='LRM',
                         help='minimum lr rate (default: 1e-5)')
-    parser.add_argument('--lr_patience',
-                        type=int,
-                        default=6,
-                        metavar='LRP',
+    parser.add_argument('--lr_patience', type=int, default=6, metavar='LRP',
                         help='hold before decaying lr (default: 6)')
-    parser.add_argument('--lr_factor',
-                        type=int,
-                        default=2,
-                        metavar='LRF',
+    parser.add_argument('--lr_factor', type=int, default=2, metavar='LRF',
                         help='lr decay factor (default: 2)')
+    # Architecture
+    parser.add_argument('--n_hidden', type=int, default=2000, metavar='NH',
+                        help='number of hidden units in MLP (default: 100)')
+    parser.add_argument('--n_outputs', type=int, default=2, metavar='NO',
+                        help='number of output units in MLP (default: 10)')
+    parser.add_argument('--n_tasks',
+                        type=int,
+                        default=20,
+                        metavar='NT',
+                        help='number of tasks (default: 10)')
 
     args = parser.parse_args()
     print('=' * 100)

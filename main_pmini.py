@@ -15,11 +15,13 @@ import random
 from copy import deepcopy
 
 from scipy.stats import wasserstein_distance
+from scipy.spatial.distance import euclidean
 
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 def init_weights(m):
     if type(m) == nn.Linear or type(m) == nn.Conv2d or type(m) == Linear:
-        # torch.nn.init.xavier_uniform(m.weight)
         torch.nn.init.kaiming_uniform_(
             m.weight, mode='fan_in', nonlinearity='relu')
 
@@ -54,12 +56,15 @@ class Linear(nn.Linear):
 
 # Define MLP model
 class MLPNet(nn.Module):
-    def __init__(self, n_hidden=100, n_outputs=10):
+    def __init__(self, n_hidden=100, n_outputs=10, taskcla=None):
         super(MLPNet, self).__init__()
         self.act = OrderedDict()
-        self.lin1 = Linear(784, n_hidden, n_hidden, bias=False)
+        self.lin1 = Linear(28*28, n_hidden, n_hidden, bias=False)
         self.lin2 = Linear(n_hidden, n_hidden, n_hidden, bias=False)
-        self.fc1 = Linear(n_hidden, n_outputs, n_outputs, bias=False)
+        self.fc1 = torch.nn.ModuleList()
+        self.taskcla = taskcla
+        for t, n in self.taskcla:
+            self.fc1.append(nn.Linear(n_hidden, n))
 
     def forward(self, x, t, p, epoch):
         if p is None:
@@ -70,7 +75,6 @@ class MLPNet(nn.Module):
             x = self.lin2(x, t, None, epoch)
             x = F.relu(x)
             self.act['fc1'] = x
-            x = self.fc1(x, t, None, epoch)
         else:
             self.act['Lin1'] = x
             x = self.lin1(x, t, p[0], epoch)
@@ -79,52 +83,41 @@ class MLPNet(nn.Module):
             x = self.lin2(x, t, p[1], epoch)
             x = F.relu(x)
             self.act['fc1'] = x
-            x = self.fc1(x, t, p[2], epoch)
-        return x
+        return self.fc1[t](x)
 
 
-def contrast_cls(data, every_task_base, sim_tasks,
-                 sim_scores, model, task_id, device):
+def contrast_cls(every_task_base, sim_tasks, model, task_id, device):
     l2 = 0
     cnt = 0
-    list_keys = list(model.act.keys())
+    stride_list = [1, 1, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1]
+
+    ttt = 0
     for k, (m, params) in enumerate(model.named_parameters()):
-        sim = []
+        if 'fc' not in m:
+            sz = params.size(0)
+            current_base = torch.FloatTensor(every_task_base[task_id-1][cnt]).to(device)
+            norm_project = torch.mm(current_base, current_base.transpose(1, 0))
+            current_proj_weight = torch.mm(params.view(sz, -1),
+                                        norm_project).view(params.size())
+            loss = []
+            for tt in sim_tasks[cnt-ttt]:
+                tmp = torch.FloatTensor(every_task_base[tt][cnt]).to(device)
+                norm_project = torch.mm(tmp, tmp.transpose(1, 0))
+                sim_proj_weight = torch.mm(params.view(sz, -1),
+                                        norm_project).view(params.size())
+                
+                if current_proj_weight.view(sz, -1).shape[0] != sim_proj_weight.view(sz, -1).shape[0] \
+                    or current_proj_weight.view(sz, -1).shape[1] != sim_proj_weight.view(sz, -1).shape[1]:
+                    continue
 
-        for tt in range(task_id):
-            sz = params.grad.data.size(0)
-            tmp = torch.FloatTensor(every_task_base[tt][cnt]).to(device)
-            norm_project = torch.mm(tmp, tmp.transpose(1, 0)).to(device)
-            if "conv" in m:
-                proj_weight = torch.mm(params.view(sz, -1),
-                                       norm_project).view(params.size())
-            else:
-                proj_weight = torch.mm(params, norm_project)
-            sim.append(proj_weight)
-            dis = list(set(range(task_id)) - set(sim_tasks[cnt]))
-            tt = random.sample(dis, 1)[0]
-            tmp = torch.FloatTensor(every_task_base[tt][cnt]).to(device)
-            norm_project = torch.mm(tmp, tmp.transpose(1, 0))
-            proj_weight = torch.mm(params.view(sz, -1),
-                                    norm_project).view(params.size())
-            sim.append(proj_weight)
-            if len(sim) >= 4:
-                break
-
-        sim = torch.stack(sim).view(4, -1)
-        if sum(sim_scores[cnt]) != 2:
-            idxs = torch.arange(0, sim.shape[0], device=device)
-            y_true = idxs + 1 - idxs % 2 * 2
-            similarities = F.cosine_similarity(sim.unsqueeze(1), sim.unsqueeze(0), dim=2)
-
-            similarities = similarities - torch.eye(sim.shape[0], device=device) * 1e12
-            similarities = similarities / 0.05
-
-            loss = F.cross_entropy(similarities, y_true)
-            l2 += torch.mean(loss)
-
+                cos_sim = torch.nn.functional.cosine_similarity(current_proj_weight.view(sz, -1),sim_proj_weight.view(sz, -1), dim=1)
+                cos_sim = (torch.mean(cos_sim) + 1.0) / 2.0 
+                label = torch.ones(1).to(device)
+                loss.append(torch.nn.functional.binary_cross_entropy(cos_sim.view(1), label))
+            if len(loss) != 0:
+                loss = torch.mean(torch.stack(loss))
+                l2 += loss
         cnt += 1
-
     return l2
 
 
@@ -139,7 +132,8 @@ def train(args, epoch, task_id, model, device, x, y, optimizer, criterion):
             b = r[i:i+args.batch_size_train]
         else:
             b = r[i:]
-        data = x[b].view(-1, 28 * 28)
+        b = b.to(x.device)
+        data = x[b].view(-1, 28*28)
         data, target = data.to(device), y[b].to(device)
         optimizer.zero_grad()
         output = model(data, task_id, None, -1)
@@ -148,26 +142,7 @@ def train(args, epoch, task_id, model, device, x, y, optimizer, criterion):
         optimizer.step()
 
 
-def train_projected(args, p, model, device, x, y, optimizer, criterion, feature_mat, task_id, epoch, sim_tasks, sim_scores, every_task_base):
-    
-    
-    flag = True
-    if flag: 
-        for i in range(task_id):
-            x = torch.cat((x, args.extra_data[i][0]), 0)
-            y = torch.cat((y, args.extra_data[i][1]), 0)
-        j=[]
-        if task_id ==7:
-            j = [5,6]
-        elif task_id ==8:
-            j=[0,1,2]
-        elif task_id ==9:
-            j=[5,7]
-        for jj in j:
-            x = torch.cat((x, args.extra_data_plus[jj][0]), 0)
-            y = torch.cat((y, args.extra_data_plus[jj][1]), 0)
-    
-    
+def train_projected(args, p, model, device, x, y, optimizer, criterion, feature_mat, task_id, epoch, sim_tasks,  every_task_base):
     model.train()
     r = np.arange(x.size(0))
     np.random.shuffle(r)
@@ -178,27 +153,28 @@ def train_projected(args, p, model, device, x, y, optimizer, criterion, feature_
             b = r[i:i+args.batch_size_train]
         else:
             b = r[i:]
-        data = x[b].view(-1, 28 * 28)
+        b = b.to(x.device)
+        data = x[b].view(-1, 28*28)
         data, target = data.to(device), y[b].to(device)
         optimizer.zero_grad()
         output = model(data, task_id, p, epoch=epoch + i)
         loss = criterion(output, target)
 
         if len(sim_tasks) != 0:
-            l2 = contrast_cls(data, every_task_base, sim_tasks,
-                              sim_scores, model, task_id, device)
+            l2 = contrast_cls(every_task_base, sim_tasks,
+                               model, task_id, device)
             loss += l2
 
         loss.backward()
         # Gradient Projections
         kk = 0
         for k, (m, params) in enumerate(model.named_parameters()):
-            if k < 3 and len(params.size()) != 1:
-                sz = params.grad.data.size(0)
+            if k < 2 and len(params.size()) != 1:
+                sz = params.size(0)
                 params.grad.data = params.grad.data - torch.mm(params.grad.data.view(sz, -1),
                                                                feature_mat[kk]).view(params.size())
                 kk += 1
-            elif (k < 3 and len(params.size()) == 1) and task_id != 0:
+            elif (k < 2 and len(params.size()) == 1) and task_id != 0:
                 params.grad.data.fill_(0)
 
         optimizer.step()
@@ -219,9 +195,10 @@ def test(args, model, device, x, y, criterion, id=None):
                 b = r[i:i + args.batch_size_test]
             else:
                 b = r[i:]
-            data = x[b].view(-1, 28 * 28)
+            b = b.to(x.device)
+            data = x[b].view(-1, 28*28)
             data, target = data.to(device), y[b].to(device)
-            output = model(data, -1, None, -1)
+            output = model(data, id, None, -1)
             loss = criterion(output, target)
             pred = output.argmax(dim=1, keepdim=True)
 
@@ -239,21 +216,19 @@ def get_representation_matrix(task_id, net, device, x, y, old_task_distribution)
     r = np.arange(x.size(0))
     np.random.shuffle(r)
     r = torch.LongTensor(r).to(device)
-    un = torch.unique(y)
-    idx = 0
-    for _ in range(30):
-        b = []
-        for i in un:
-            while y[idx] != i:
-                idx += 1
-            b.append(idx)
-        assert len(b) == 10
-        tmp_data = x[b].view(-1, 28*28).to(device)
-        target = y[b]
-        example_data.append(tmp_data)
+    size = x.size(0)
+    if size > 300:
+        b = np.random.choice(size, 300, replace=False)
+    else:
+        b = np.random.choice(size, 300, replace=True)
+    
+    print(x[b].shape)
+    tmp_data = x[b].view(-1, 28*28).to(device)
+    target = y[b]
+    example_data.append(tmp_data)
 
     example_data = torch.cat(example_data, dim=0).squeeze(1)
-    example_data = example_data.view(-1, 28 * 28)
+    example_data = example_data.view(-1, 28*28)
     net.eval()
     example_out = net(example_data, task_id, None, -1)
 
@@ -288,7 +263,7 @@ def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, 
 
             sval_total = (S**2).sum()
             sval_ratio = (S**2) / sval_total
-            r = np.sum(np.cumsum(sval_ratio) < threshold[i])  
+            r = np.sum(np.cumsum(sval_ratio) < threshold[i])  # +1
             feature_list.append(U[:, 0:r])
             proj[task_id][i] = U[:, 0:r]
             every_task_base[task_id][i] = U[:, 0:r]
@@ -298,7 +273,7 @@ def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, 
             U1, S1, Vh1 = np.linalg.svd(activation, full_matrices=False)
             sval_total = (S1**2).sum()
             sval_ratio = (S1**2)/sval_total
-            r = np.sum(np.cumsum(sval_ratio) < threshold[i])  
+            r = np.sum(np.cumsum(sval_ratio) < threshold[i])  # +1
             every_task_base[task_id][i] = U1[:, 0:r]
 
             act_hat = activation - np.dot(
@@ -342,35 +317,107 @@ def update_GPM(task_id, model, mat_list, threshold, feature_list=[], proj=None, 
     return feature_list
 
 
+def update_task_discrimination(task_id, feature_list_ori, feature_list_new, threshold=0.7):
+
+    #计算训练后的下一个任务和原任务的距离
+    distance_ori = []
+    for t in range(task_id):
+        distance_ori.append(
+            wasserstein_distance(
+                feature_list_ori[task_id].flatten(), feature_list_ori[t].flatten()
+            )
+        )
+    distance_new = []
+    for t in range(task_id):
+        distance_new.append(
+            wasserstein_distance(
+                feature_list_new[t].flatten(), feature_list_new[t].flatten()
+            )
+        )
+
+    distance_ori_np = np.array(distance_ori)
+    distance_new_np = np.array(distance_new)
+
+    dis = np.abs((distance_ori_np - distance_new_np))
+    indices = np.where(dis < 0.1)
+    factors = 10 ** (np.ceil(-np.log10(dis[indices])) -1)
+    dis[indices] *= factors
+
+    sim_flag_1 = distance_new_np < distance_ori_np
+    sim_flag_2 = dis > threshold
+    sim_flag = sim_flag_1 * sim_flag_2
+
+    sim_tasks= np.where(sim_flag)[0]
+    if len(sim_tasks) > 2:
+        sim_tasks = sim_tasks[np.argsort(dis[sim_tasks])[-2:]]
+    return sim_tasks
+
+
+def update_task_discrimination_euclidean(task_id, feature_list_ori, feature_list_new, threshold=0.7):
+
+    #计算训练后的下一个任务和原任务的距离
+    distance_ori = []
+    for t in range(task_id):
+        distance_ori.append(
+            euclidean(
+                feature_list_ori[task_id].flatten(), feature_list_ori[t].flatten()
+            )
+        )
+    distance_new = []
+    for t in range(task_id):
+        distance_new.append(
+            euclidean(
+                feature_list_new[t].flatten(), feature_list_new[t].flatten()
+            )
+        )
+
+    distance_ori_np = np.array(distance_ori)
+    distance_new_np = np.array(distance_new)
+
+    dis = np.abs((distance_ori_np - distance_new_np))
+    indices = np.where(dis < 0.1)
+    factors = 10 ** (np.ceil(-np.log10(dis[indices])) -1)
+    dis[indices] *= factors
+
+    sim_flag_1 = distance_new_np < distance_ori_np
+    sim_flag_2 = dis > threshold
+    sim_flag = sim_flag_1 * sim_flag_2
+
+    sim_tasks= np.where(sim_flag)[0]
+    if len(sim_tasks) > 2:
+        sim_tasks = sim_tasks[np.argsort(dis[sim_tasks])[-2:]]
+    return sim_tasks
+
+
+def set_seed(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main(args):
     tstart = time.time()
     # Device Setting
     device = torch.device("cuda:{}".format(args.cuda)
                           if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
 
-    from dataloader import pmnist as pmd
+    set_seed(args.seed)
+    from dataloader import pmnist as mes
 
+    data,taskcla,inputsize=mes.get(seed=args.seed)
 
-    data, taskcla, inputsize = pmd.get(seed=args.seed, pc_valid=args.pc_valid, fixed_order=True)
-    args.extra_data = []
-    for t in data.keys():
-        indices = np.random.choice(np.arange(data[t]['train']['x'].shape[0]), int(len(data[t]['train']['x'])*0.20))
-        args.extra_data.append((data[t]['train']['x'][indices], data[t]['train']['y'][indices]))
-    args.extra_data_plus = []
-    for t in data.keys():
-        indices = np.random.choice(np.arange(data[t]['train']['x'].shape[0]), int(len(data[t]['train']['x'])*0.20))
-        args.extra_data_plus.append((data[t]['train']['x'][indices], data[t]['train']['y'][indices]))
-
-    n_task = args.n_tasks
+    n_task = 10
     acc_matrix = np.zeros((n_task, n_task))
     criterion = torch.nn.CrossEntropyLoss()
 
     task_id = 0
     task_list = []
 
-    model = MLPNet(args.n_hidden, args.n_outputs).to(device)
+    model = MLPNet(args.n_hidden, args.n_outputs, taskcla).to(device)
     # model.apply(init_weights)
     print('Model parameters ---')
     for k_t, (m, param) in enumerate(model.named_parameters()):
@@ -419,8 +466,8 @@ def main(args):
         proj[task_id] = {}
         every_task_base[task_id] = {}
 
-        if task_id==0:
-            model = MLPNet(args.n_hidden, args.n_outputs).to(device)
+        if task_id == 0:
+            model = MLPNet(args.n_hidden, args.n_outputs, taskcla).to(device)
             # model.apply(init_weights)
             feature_list = []
             optimizer = optim.SGD(model.parameters(),
@@ -432,12 +479,12 @@ def main(args):
                       xtrain, ytrain, optimizer, criterion)
                 clock1 = time.time()
                 tr_loss, tr_acc = test(args, model, device, xtrain, ytrain,
-                                       criterion)
+                                       criterion, task_id)
                 print('Epoch {:3d} | Train: loss={:.3f}, acc={:5.1f}% | time={:5.1f}ms |'.format(epoch,
                                                                                                  tr_loss, tr_acc, 1000*(clock1-clock0)), end='')
                 # Validate
                 valid_loss, valid_acc = test(args, model, device, xvalid,
-                                             yvalid, criterion)
+                                             yvalid, criterion, task_id)
                 print(' Valid: loss={:.3f}, acc={:5.1f}% |'.format(
                     valid_loss, valid_acc),
                     end='')
@@ -459,7 +506,7 @@ def main(args):
             # Test
             print('-' * 40)
             test_loss, test_acc = test(args, model, device, xtest, ytest,
-                                       criterion)
+                                       criterion, task_id)
             print('Test: loss={:.3f} , acc={:5.1f}%'.format(
                 test_loss, test_acc))
 
@@ -471,70 +518,29 @@ def main(args):
 
         else:
 
-            sim_tasks = []
-            sim_scores = []
+            sim_tasks = [[] for i in range(3)]
+            _ = get_representation_matrix(
+                task_id, model, device, xtrain, ytrain, old_task_distribution)
+            cnt = 0
+            for kk, (m, params) in enumerate(model.named_parameters()):
+                if len(params.size()) != 1 and 'fc' not in m:
+                    pre_tmp = []
+                    old_tmp = []
+                    for ttt in range(task_id+1):
+                        pre_tmp.append(pre_task_distribution[ttt][cnt][0])
+                        old_tmp.append(old_task_distribution[ttt][cnt][0])
+                    sim_tasks[cnt] = update_task_discrimination(task_id, pre_tmp, old_tmp, threshold=0.95)
+                    cnt += 1
 
-            if task_id >= 3:
-                sim_tasks = [i for i in range(3)]
-                sim_scores = [i for i in range(3)]
-
-                _ = get_representation_matrix(
-                    task_id, model, device, xtrain, ytrain, old_task_distribution)
-                distribution = [[[]
-                                 for j in range(task_id)] for i in range(3)]
-
-                cnt = 0
-                for kk, (m, params) in enumerate(model.named_parameters()):
-                    if len(params.size()) != 1 and kk < 3:
-                        for tt in range(task_id):
-
-                            a = wasserstein_distance(
-                                old_task_distribution[tt][cnt][0], old_task_distribution[task_id][cnt][0])
-                            distribution[cnt][tt] = a
-                        cnt += 1
-                print(distribution)
-
-                cnt = 0
-                for kk, (m, params) in enumerate(model.named_parameters()):
-                    if len(params.size()) != 1 and kk < 3:
-                        for tt in range(task_id):
-
-                            t = wasserstein_distance(
-                                pre_task_distribution[tt][cnt][0], pre_task_distribution[task_id][cnt][0])
-                            if t < distribution[cnt][tt]:
-                                distribution[cnt][tt] = 1000
-                        cnt += 1
-
-                print(distribution)
-
-                for idx, ii in enumerate(distribution):
-                    sim_tasks[idx] = sorted(
-                        range(len(ii)), key=lambda i: ii[i])[:2]
-                print(sim_tasks)
-
-
-                for idx, ii in enumerate(distribution):
-                    if ii.count(ii[0]) == len(ii) and ii[0] == 1000:
-                        tmp = [1, 1]
-                    elif abs(sum(ii) - 0) < 1e-4:
-                        tmp = [1, 1]
-                    else:
-                        tmp = sorted(ii)[:2]
-
-                        t = [sum(tmp) - i for i in tmp]
-                        tmp = [i/sum(t) for i in t]
-                    sim_scores[idx] = tmp
-                print(sim_scores)
-
-                print("*" * 40)
-                print("Task {} has sim Tasks".format(task_id), end="")
-                cnt = 0
-                for kk, (m, params) in enumerate(model.named_parameters()):
-                    if len(params.size()) != 1 and kk < 4:
-                        print("Layer: {}".format(cnt))
-                        print(sim_tasks[cnt], sim_scores[cnt])
-                        cnt += 1
-                print("*" * 40)
+            print("*" * 40)
+            print("Task {} has sim Tasks".format(task_id), end="")
+            cnt = 0
+            for kk, (m, params) in enumerate(model.named_parameters()):
+                if len(params.size()) != 1 and 'fc' not in m:
+                    print("Layer: {}".format(cnt))
+                    print(sim_tasks[cnt])
+                    cnt += 1
+            print("*" * 40)
 
             optimizer = optim.SGD(model.parameters(),
                                   lr=args.lr, momentum=args.momentum)
@@ -559,15 +565,15 @@ def main(args):
 
                 clock0 = time.time()
                 train_projected(args, p, model, device, xtrain,
-                                ytrain, optimizer, criterion, feature_mat, k, epoch, sim_tasks, sim_scores, every_task_base)
+                                ytrain, optimizer, criterion, feature_mat, k, epoch, sim_tasks,  every_task_base)
                 clock1 = time.time()
                 tr_loss, tr_acc = test(args, model, device, xtrain, ytrain,
-                                       criterion)
+                                       criterion, task_id)
                 print('Epoch {:3d} | Train: loss={:.3f}, acc={:5.1f}% | time={:5.1f}ms |'.format(epoch,
                                                                                                  tr_loss, tr_acc, 1000*(clock1-clock0)), end='')
                 # Validate
                 valid_loss, valid_acc = test(args, model, device, xvalid,
-                                             yvalid, criterion)
+                                             yvalid, criterion, task_id)
                 print(' Valid: loss={:.3f}, acc={:5.1f}% |'.format(
                     valid_loss, valid_acc),
                     end='')
@@ -577,10 +583,11 @@ def main(args):
                     print(' *', end='')
                 scheduler.step()
                 print()
+            
 
             # Test
             test_loss, test_acc = test(args, model, device, xtest, ytest,
-                                       criterion)
+                                       criterion, task_id)
             print('Test: loss={:.3f} , acc={:5.1f}%'.format(
                 test_loss, test_acc))
             # Memory Update
@@ -595,7 +602,7 @@ def main(args):
             xtest = data[ii]['test']['x']
             ytest = data[ii]['test']['y']
             _, acc_matrix[task_id, jj] = test(args, model, device, xtest,
-                                              ytest, criterion)
+                                              ytest, criterion,ii)
             jj += 1
         print('Accuracies =')
         for i_a in range(task_id + 1):
@@ -613,17 +620,16 @@ def main(args):
     print('Backward transfer: {:5.2f}%'.format(bwt))
     print('[Elapsed time = {:.1f} ms]'.format((time.time() - tstart) * 1000))
     print('-' * 50)
-    print(np.diag(acc_matrix))
 
 
 if __name__ == "__main__":
     # Training parameters
     parser = argparse.ArgumentParser(description='Sequential PMNIST with GPM')
-    parser.add_argument('--cuda', default=0, type=int,
+    parser.add_argument('--cuda', default=2, type=int,
                         help='default GPU device')
     parser.add_argument('--batch_size_train',
                         type=int,
-                        default=64,
+                        default=10,
                         metavar='N',
                         help='input batch size for training (default: 10)')
     parser.add_argument('--batch_size_test',
